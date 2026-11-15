@@ -28,30 +28,68 @@ and change the settings of an existing container without losing what you install
 
 ## Install
 
-**Any Linux, no Python setup needed** (uses [uv](https://docs.astral.sh/uv/), which fetches a Python if needed):
+Pick one. All of them give you a `tdock` command.
+
+| Method | Command | Good for |
+|---|---|---|
+| **uv** (recommended) | `uv tool install tdock` | Any Linux. No Python setup needed: uv downloads a Python if yours is missing or too old |
+| **pipx** | `pipx install tdock` | If you already use pipx |
+| **pip** | `pip install tdock` | Inside a conda env or virtualenv you already use |
+| **Install script** | see below | Uses your Python 3.9+ if usable, otherwise falls back to uv |
+
+### uv (recommended)
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # once
+curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv once (no root needed)
 uv tool install tdock
+tdock
 ```
 
-Or with the install script, which uses your Python 3.9+ if available and falls back to uv otherwise:
+uv and pipx install tdock into its own isolated environment and put only the `tdock` command on your PATH,
+so it works whichever conda env or virtualenv is active, and it does not add packages to your environments.
+
+### pip
+
+```bash
+conda activate myenv    # or: source .venv/bin/activate
+pip install tdock
+tdock
+```
+
+With pip, `tdock` is installed into **that** environment: the command is available only while it is active,
+and its dependencies (such as `textual`) are added to it.
+
+On recent Debian/Ubuntu, `pip install` into the system Python is blocked with
+`externally-managed-environment` (also with `--user`). Use uv or pipx there.
+
+### Install script
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Taepoung/tdock/main/install.sh | bash
+# uninstall
+curl -fsSL https://raw.githubusercontent.com/Taepoung/tdock/main/install.sh | bash -s -- --uninstall
 ```
 
-If you already manage Python tools:
+Installs into `~/.local/share/tdock` and links `~/.local/bin/tdock`.
+
+### `tdock: command not found`?
+
+uv, pipx and the install script put the command in `~/.local/bin`. If that is not on your PATH yet:
 
 ```bash
-pipx install tdock
-pip install tdock      # inside a virtualenv / conda env
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-On recent Debian/Ubuntu, a plain `pip install` into the system Python is blocked
-(`externally-managed-environment`); use one of the methods above.
+(`uv tool update-shell` or `pipx ensurepath` do the same.)
 
-Update with `uv tool upgrade tdock`, `pipx upgrade tdock` or `pip install -U tdock`.
+### Update / uninstall
+
+| Method | Update | Uninstall |
+|---|---|---|
+| uv | `uv tool upgrade tdock` | `uv tool uninstall tdock` |
+| pipx | `pipx upgrade tdock` | `pipx uninstall tdock` |
+| pip | `pip install -U tdock` | `pip uninstall tdock` |
 
 ## Usage
 
