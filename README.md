@@ -41,9 +41,14 @@ Pick one. All of them give you a `tdock` command.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv once (no root needed)
+source $HOME/.local/bin/env                       # or open a new terminal
 uv tool install tdock
 tdock
 ```
+
+The uv installer adds `~/.local/bin` to your PATH by editing your shell config (`~/.bashrc` and similar),
+but that only takes effect in **new** terminals, hence the `source` line.
+If you installed uv some other way (or the PATH line is missing), run `uv tool update-shell` once and open a new terminal.
 
 uv and pipx install tdock into its own isolated environment and put only the `tdock` command on your PATH,
 so it works whichever conda env or virtualenv is active, and it does not add packages to your environments.
@@ -74,7 +79,8 @@ Installs into `~/.local/share/tdock` and links `~/.local/bin/tdock`.
 
 ### `tdock: command not found`?
 
-uv, pipx and the install script put the command in `~/.local/bin`. If that is not on your PATH yet:
+uv, pipx and the install script put the command in `~/.local/bin`. Open a new terminal first;
+if it is still not found, `~/.local/bin` is not on your PATH yet:
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
