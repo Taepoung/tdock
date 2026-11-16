@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from rich.text import Text
+
+from . import services as svc
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -355,8 +357,11 @@ class RunSpec:
     tz: str = TZ_SERVER          # "server" | "image" | 시간대 이름 (예: Asia/Seoul)
     extra: str = ""              # 추가 docker run 인자
     command: str = ""            # 비우면 이미지 기본 CMD
+    hook: bool = True            # 서비스 자동 시작 훅 (/etc/tdock/startup.sh)
+    base_argv: Optional[list] = None   # 다시 만들 때 기존 컨테이너의 원래 명령
 
-    def args(self) -> list[str]:
+    def args(self, argv: Optional[list] = None) -> list[str]:
+        """argv: 훅으로 감쌀 원래 명령 (resolve_argv). None 이면 훅 없이 만든다."""
         a = ["docker", "run", "-d"]
         if self.name:
             a += ["--name", self.name]
@@ -410,10 +415,14 @@ class RunSpec:
             a += ["-e", e]
         if self.extra:
             a += shlex.split(self.extra)
+        if self.hook and argv is not None:
+            pre, post = svc.hook_args(argv)
+            return a + pre + [self.image] + post
         a.append(self.image)
         if self.command:
             a += shlex.split(self.command)
         return a
+
 
     def validate(self) -> list[str]:
         errs = []
@@ -462,6 +471,43 @@ class RunSpec:
         except ValueError as e:
             errs.append(f"Argument quoting error: {e}")
         return errs
+
+
+def resolve_argv(spec: RunSpec) -> Optional[list]:
+    """훅으로 감쌀 원래 명령 (entrypoint + cmd). 이미지가 로컬에 없으면 None."""
+    if spec.command and spec.base_argv is not None:
+        return shlex.split(spec.command)
+    if not spec.command and spec.base_argv is not None:
+        return list(spec.base_argv)
+    try:
+        cfg = inspect(spec.image)[0].get("Config") or {}
+    except (DockerError, IndexError, ValueError):
+        return None
+    ep, cmd = cfg.get("Entrypoint") or [], cfg.get("Cmd") or []
+    inner = svc.unwrap_hook(ep, cmd)
+    if inner is not None:              # tdock 이 commit 한 이미지
+        return shlex.split(spec.command) if spec.command else inner
+    return ep + (shlex.split(spec.command) if spec.command else cmd)
+
+
+def has_sh(image: str) -> bool:
+    return subprocess.run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "/bin/sh", image,
+                           "-c", "true"], capture_output=True).returncode == 0
+
+
+def container_argv(c: dict) -> list:
+    """컨테이너의 원래 명령 (훅으로 감쌌으면 벗겨서)."""
+    cfg = c.get("Config") or {}
+    inner = svc.unwrap_hook(cfg.get("Entrypoint"), cfg.get("Cmd"))
+    return inner if inner is not None else (cfg.get("Entrypoint") or []) + (cfg.get("Cmd") or [])
+
+
+def has_hook_or_script(name: str) -> bool:
+    return subprocess.run(["docker", "exec", name, "test", "-f", svc.SCRIPT], capture_output=True).returncode == 0
+
+
+def has_hook(c: dict) -> bool:
+    return ((c.get("Config") or {}).get("Labels") or {}).get(svc.HOOK_LABEL) == "1"
 
 
 def gpu_desc(c: dict) -> str:
@@ -568,6 +614,7 @@ def spec_from_container(c: dict) -> tuple[RunSpec, list[str]]:
         ptrace=any(cap.upper() in ("SYS_PTRACE", "CAP_SYS_PTRACE") for cap in caps),
         tz=tz_of(c),
         extra=shlex.join(extra),
+        base_argv=container_argv(c),
     )
     return spec, warns
 
@@ -1481,12 +1528,23 @@ class RunForm(Screen[None]):
         if self.has("#mem_on"):
             self.query_one("#memory", Input).disabled = not self.cb("mem_on")
         try:
-            cmd = " \\\n  ".join(_group_args(spec.args()))
+            cmd = " \\\n  ".join(_group_args(spec.args(self.preview_argv(spec))))
         except ValueError as e:
             cmd = f"(argument error: {e})"
         self.query_one("#preview", Static).update(Text(cmd, style="green"))
         errs = self.errors(spec)
         self.query_one("#errors", Static).update(Text("\n".join(errs), style="red"))
+
+    def preview_argv(self, spec: RunSpec) -> Optional[list]:
+        if not spec.hook:
+            return None
+        key = (spec.image, spec.command, tuple(spec.base_argv or ()))
+        cache = self.__dict__.setdefault("_argv_cache", {})
+        if key not in cache:
+            argv = resolve_argv(spec)
+            # 이미지가 아직 없으면 실행할 때 결정된다
+            cache[key] = argv if argv is not None else ["<image default command>"]
+        return cache[key]
 
     def errors(self, spec: RunSpec) -> list[str]:
         errs = spec.validate()
@@ -1543,8 +1601,8 @@ class RunForm(Screen[None]):
 def _group_args(args: list[str]) -> list[str]:
     """미리보기용: 옵션과 값을 한 줄로, 이미지와 명령을 한 줄로 묶는다."""
     takes_value = {"--name", "--gpus", "--restart", "-v", "-p", "-e", "--network", "--ipc", "--user",
-                   "--ulimit", "--cap-add", "--mount"}
-    q = [shlex.quote(a) for a in args]
+                   "--ulimit", "--cap-add", "--mount", "--entrypoint", "--label"}
+    q = ["'<tdock startup hook>'" if a == svc.HOOK else shlex.quote(a) for a in args]
     out, i = [" ".join(q[:3])], 3
     while i < len(args):
         if args[i] in takes_value and i + 1 < len(args):
@@ -1559,12 +1617,387 @@ def _group_args(args: list[str]) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------- 서비스 (자동 시작)
+
+def host_public_keys() -> str:
+    """SSH 공개키 기본값: 호스트의 authorized_keys, 없으면 ~/.ssh/*.pub"""
+    ssh = Path.home() / ".ssh"
+    for f in [ssh / "authorized_keys", *sorted(ssh.glob("*.pub"))]:
+        try:
+            text = f.read_text().strip()
+        except OSError:
+            continue
+        if text:
+            return text
+    return ""
+
+
+def host_port_for(c: dict, cport: int) -> Optional[str]:
+    for p in ports_of(c):
+        hostpart, _, cp = p.rpartition(":")
+        if cp.split("/")[0] == str(cport):
+            return hostpart.rpartition(":")[2]
+    return None
+
+
+class ServiceLog(ModalScreen[None]):
+    BINDINGS = [Binding("escape,q", "dismiss", "Close"), Binding("r", "reload", "Refresh")]
+
+    def __init__(self, container: str, sid: str) -> None:
+        super().__init__()
+        self.container, self.sid = container, sid
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tasklog"):
+            yield Static(Text(f"Service log: {self.sid} in {self.container}  "
+                              f"({svc.LOG_DIR}/{self.sid}.log, r refresh, esc close)", style="bold"))
+            yield RichLog(wrap=True, markup=False, max_lines=5000)
+
+    def on_mount(self) -> None:
+        self.action_reload()
+
+    def action_reload(self) -> None:
+        log = self.query_one(RichLog)
+        log.clear()
+        log.write(Text(svc.read_log(self.container, self.sid)))
+
+
+class ServiceRow(Horizontal):
+    """서비스 한 줄: 이름 | 설치 여부 | 상태 | Start with container | Restart if it dies | Start/Stop | Log"""
+
+    def __init__(self, sid: str, label: str, entry: dict, installed: Optional[bool], custom: bool = False) -> None:
+        super().__init__(classes="svc-row", id=f"row-{sid}")
+        self.sid, self.label, self.entry, self.inst, self.custom = sid, label, entry, installed, custom
+
+    def compose(self) -> ComposeResult:
+        usable = self.inst is not False
+        if self.custom:
+            yield Input(self.entry.get("command", ""), id=f"cmdtext-{self.sid}", classes="svc-cmd",
+                        placeholder="command, run in the foreground (e.g. python serve.py)")
+        else:
+            yield Static(Text(self.label, style="bold"), classes="svc-name")
+        if not self.custom:
+            inst = {True: Text("✓ installed", style="green"), False: Text("✗ not installed", style="dim"),
+                    None: Text("?", style="dim")}[self.inst]
+            yield Static(inst, classes="svc-inst")
+        yield Static(Text("-", style="dim"), id=f"st-{self.sid}", classes="svc-status")
+        auto = bool(self.entry.get("autostart")) and usable
+        yield Checkbox("Start with container", value=auto, id=f"auto-{self.sid}", disabled=not usable)
+        yield Checkbox("Restart if it dies", value=auto and bool(self.entry.get("keep")),
+                       id=f"keep-{self.sid}", disabled=not auto)
+        yield Button("Start", id=f"run-{self.sid}", classes="svc-btn", disabled=not usable)
+        yield Button("Log", id=f"log-{self.sid}", classes="svc-btn")
+        if self.custom:
+            yield Button("✕", id=f"del-{self.sid}", variant="error", classes="svc-btn")
+
+
+class ServicesScreen(Screen[None]):
+    BINDINGS = [Binding("ctrl+s", "apply", "Apply"), Binding("escape", "close", "Close")]
+
+    def __init__(self, c: dict, cfg: dict, installed: dict, statuses: dict) -> None:
+        super().__init__()
+        self.c = c
+        self.cname = c["Name"].lstrip("/")
+        self.saved = json.loads(json.dumps(cfg))     # 컨테이너에 저장된 설정
+        self.cfg = cfg
+        self.inst = installed
+        self.statuses = statuses
+        self.running = bool(c["State"].get("Running"))
+        self.hook = has_hook(c)
+        hc = c.get("HostConfig") or {}
+        self.mem_total = docker_caps()["mem_gib"] << 30
+        self.cur_mem = hc.get("Memory") or 0
+        self.cur_restart = (hc.get("RestartPolicy") or {}).get("Name") in ("unless-stopped", "always")
+        self.cur_cpus = f"{hc['NanoCpus'] / 1e9:g}" if hc.get("NanoCpus") else ""
+
+    # ---- 화면
+    def compose(self) -> ComposeResult:
+        s = self.cfg["services"]
+        caps = docker_caps()
+        yield Header()
+        with VerticalScroll(id="form"):
+            yield Static(Text(f"Services: {self.cname}", style="bold"))
+            if not self.hook:
+                with Horizontal(classes="svc-banner"):
+                    yield Static(Text("⚠ This container was not created by tdock, so it cannot start services "
+                                      "automatically. Recreate it once to add the startup hook "
+                                      "(what you installed inside is kept).", style="yellow"))
+                    yield Button("Recreate…", id="svc-recreate-hook", variant="warning")
+            if not self.running:
+                yield Static(Text("The container is stopped: settings are saved and take effect at its next start.",
+                                  style="yellow"))
+            yield Label("Services")
+            yield Static(Text("Service                Installed        Status       ", style="dim"))
+            for sid, label, _, _ in svc.BUILTIN:
+                yield ServiceRow(sid, label, s[sid], self.inst.get(sid) if self.running else None)
+            with Vertical(id="custom-rows"):
+                for cm in self.cfg["custom"]:
+                    yield ServiceRow(cm["id"], cm.get("name") or cm["id"], cm, None, custom=True)
+            yield Button("+ Add command", id="add-cmd")
+
+            yield Label("SSH authorized keys  (one public key per line)")
+            yield TextArea(s["ssh"].get("authorized_keys") or host_public_keys(), id="ssh-keys")
+            hp = host_port_for(self.c, 22)
+            yield Static(Text(f"Connect: ssh -p {hp} root@<server>" if hp else
+                              "⚠ No port mapping for container port 22: SSH is reachable only from other "
+                              "containers. Add one with Recreate (e.g. 2222:22).", style="dim" if hp else "yellow"))
+            yield Label("VS Code tunnel name")
+            yield Input(s["tunnel"].get("name", ""), id="tunnel-name", placeholder="name shown in VS Code (optional)")
+            yield Static(Text("First time only: open a shell (e) and run  code tunnel user login --provider github",
+                              style="dim"))
+            yield Label("Jupyter  (container port / token)")
+            with Horizontal(classes="tz-row"):
+                yield Input(str(s["jupyter"].get("port") or 8888), id="jup-port", type="integer")
+                yield Input(s["jupyter"].get("token", ""), id="jup-token", placeholder="token")
+            jp = host_port_for(self.c, int(s["jupyter"].get("port") or 8888))
+            yield Static(Text(f"Open: http://<server>:{jp}/?token=<token>" if jp else
+                              "⚠ No port mapping for the Jupyter port. Add one with Recreate.",
+                              style="dim" if jp else "yellow"), id="jup-note")
+
+            yield Label("Container settings  (applied immediately, no restart)")
+            with Vertical(classes="res-box"):
+                yield Checkbox("Auto-restart the container (--restart unless-stopped)", value=self.cur_restart,
+                               id="live-restart")
+                if caps["mem_limit"]:
+                    limited = 0 < self.cur_mem < self.mem_total
+                    with Horizontal(classes="res-row"):
+                        yield Checkbox("Memory limit", value=limited, id="live-mem-on")
+                        yield Input(human_size(self.cur_mem) if limited else "64g", id="live-mem")
+                        yield Static(Text(f"max {caps['mem_gib']}GiB", style="dim"), classes="res-note")
+                if caps["cpu_limit"]:
+                    with Horizontal(classes="res-row"):
+                        yield Checkbox("CPU limit", value=bool(self.cur_cpus), id="live-cpu-on")
+                        yield Input(self.cur_cpus or "16", id="live-cpus")
+                        yield Static(Text(f"max {caps['ncpu']} cores", style="dim"), classes="res-note")
+            with Horizontal(classes="buttons"):
+                yield Button("Recreate…  (GPUs, ports, mounts, image, options)", id="svc-recreate")
+            yield Static(id="svc-errors")
+            with Horizontal(classes="buttons"):
+                yield Button("Apply (ctrl+s)", variant="primary", id="svc-apply")
+                yield Button("Save & restart container", variant="warning", id="svc-restart")
+                yield Button("Close (esc)", id="svc-close")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        for ta in self.query(TextArea):
+            ta.show_line_numbers = False
+        self.show_status(self.statuses)
+        if self.running:
+            self.set_interval(3, self.poll_status)
+
+    # ---- 상태
+    @work(thread=True, exclusive=True, group="svc-status")
+    def poll_status(self) -> None:
+        st = svc.status(self.cname)
+        self.app.call_from_thread(self.show_status, st)
+
+    def show_status(self, st: dict) -> None:
+        self.statuses = st
+        colors = {"running": "green", "restarting": "yellow", "stopped": "dim"}
+        for row in self.query(ServiceRow):
+            state = st.get(row.sid, "-") if self.running else "-"
+            label = {"running": "● running", "restarting": "↻ restarting", "stopped": "○ stopped"}.get(state, "-")
+            row.query_one(f"#st-{row.sid}", Static).update(Text(label, style=colors.get(state, "dim")))
+            btn = row.query_one(f"#run-{row.sid}", Button)
+            btn.label = "Stop" if state in ("running", "restarting") else "Start"
+
+    # ---- 입력
+    @on(Checkbox.Changed)
+    def toggled(self, e: Checkbox.Changed) -> None:
+        wid = e.checkbox.id or ""
+        if wid.startswith("auto-"):
+            keep = self.query_one(f"#keep-{wid[5:]}", Checkbox)
+            keep.disabled = not e.value
+            if not e.value:
+                keep.value = False
+        if wid == "live-mem-on":
+            self.query_one("#live-mem", Input).disabled = not e.value
+
+    def collect(self) -> dict:
+        cfg = json.loads(json.dumps(self.cfg))
+        for row in self.query(ServiceRow):
+            entry = svc.service_entry(cfg, row.sid) if row.sid in [x for x, *_ in svc.BUILTIN] else None
+            if entry is None:
+                entry = next((x for x in cfg["custom"] if x["id"] == row.sid), None)
+                if entry is None:
+                    continue
+                entry["command"] = self.query_one(f"#cmdtext-{row.sid}", Input).value.strip()
+            entry["autostart"] = self.query_one(f"#auto-{row.sid}", Checkbox).value
+            entry["keep"] = entry["autostart"] and self.query_one(f"#keep-{row.sid}", Checkbox).value
+        live_ids = {r.sid for r in self.query(ServiceRow)}
+        cfg["custom"] = [x for x in cfg["custom"] if x["id"] in live_ids]
+        s = cfg["services"]
+        s["ssh"]["authorized_keys"] = self.query_one("#ssh-keys", TextArea).text.strip()
+        s["tunnel"]["name"] = self.query_one("#tunnel-name", Input).value.strip()
+        s["jupyter"]["port"] = int(self.query_one("#jup-port", Input).value or 8888)
+        s["jupyter"]["token"] = self.query_one("#jup-token", Input).value.strip()
+        return cfg
+
+    def validate(self, cfg: dict) -> list[str]:
+        errs = []
+        for cm in cfg["custom"]:
+            if msg := svc.valid_custom_command(cm["command"]):
+                errs.append(f"{cm['id']}: {msg}")
+        if cfg["services"]["ssh"]["autostart"] and not cfg["services"]["ssh"]["authorized_keys"]:
+            errs.append("SSH: add at least one public key, otherwise nobody can log in.")
+        if self.has("#live-mem-on") and self.query_one("#live-mem-on", Checkbox).value:
+            mem = size_bytes(self.query_one("#live-mem", Input).value)
+            if not mem or mem < 6 << 20 or mem > self.mem_total:
+                errs.append(f"Memory must look like 64g and be between 6m and {docker_caps()['mem_gib']}GiB.")
+        return errs
+
+    def has(self, selector: str) -> bool:
+        return bool(self.query(selector))
+
+    def live_updates(self) -> list[list[str]]:
+        """바로 바꿀 수 있는 컨테이너 설정 (docker update)."""
+        ups = []
+        restart = self.query_one("#live-restart", Checkbox).value
+        if restart != self.cur_restart:
+            ups.append(["--restart", "unless-stopped" if restart else "no"])
+        if self.has("#live-mem-on"):
+            on = self.query_one("#live-mem-on", Checkbox).value
+            want = size_bytes(self.query_one("#live-mem", Input).value) if on else self.mem_total
+            limited = 0 < self.cur_mem < self.mem_total
+            if (on and want != self.cur_mem) or (not on and limited):
+                # swap 한도를 함께 넘겨야 올리고 내리기가 된다. 해제는 서버 전체 메모리로 올리는 것으로 대신
+                ups.append(["--memory", str(want), "--memory-swap", str(want * 2)])
+        if self.has("#live-cpu-on"):
+            on = self.query_one("#live-cpu-on", Checkbox).value
+            cpus = self.query_one("#live-cpus", Input).value.strip() if on else "0"
+            if cpus != (self.cur_cpus or "0"):
+                ups.append(["--cpus", cpus])
+        return ups
+
+    # ---- 버튼
+    @on(Button.Pressed)
+    def pressed(self, e: Button.Pressed) -> None:
+        bid = e.button.id or ""
+        if bid == "svc-apply":
+            self.action_apply()
+        elif bid == "svc-close":
+            self.action_close()
+        elif bid == "svc-restart":
+            self.save_and_restart()
+        elif bid in ("svc-recreate", "svc-recreate-hook"):
+            self.app.pop_screen()
+            self.app.open_recreate(self.cname)
+        elif bid == "add-cmd":
+            cfg = self.collect()
+            sid = svc.new_custom_id(cfg)
+            entry = {"id": sid, "name": sid, "command": "", "autostart": False, "keep": False}
+            self.cfg["custom"].append(entry)
+            row = ServiceRow(sid, sid, entry, None, custom=True)
+            self.query_one("#custom-rows").mount(row)
+            self.call_after_refresh(lambda: self.query_one(f"#cmdtext-{sid}", Input).focus())
+        elif bid.startswith("del-"):
+            sid = bid[4:]
+            self.cfg["custom"] = [x for x in self.cfg["custom"] if x["id"] != sid]
+            self.query_one(f"#row-{sid}").remove()
+        elif bid.startswith("log-"):
+            if not self.running:
+                self.notify("The container is stopped.", severity="warning")
+            else:
+                self.app.push_screen(ServiceLog(self.cname, bid[4:]))
+        elif bid.startswith("run-"):
+            self.start_stop(bid[4:], str(e.button.label))
+
+    def start_stop(self, sid: str, label: str) -> None:
+        if not self.running:
+            self.notify("Start the container first.", severity="warning")
+            return
+        if sid not in svc._ids(self.saved):
+            self.notify("Apply first, then start it.", severity="warning")
+            return
+        self.run_script("stop" if label == "Stop" else "start", sid)
+
+    @work(thread=True)
+    def run_script(self, action: str, sid: str) -> None:
+        try:
+            svc.exec_script(self.cname, action, sid)
+        except RuntimeError as e:
+            self.app.call_from_thread(self.notify, f"{action} {sid} failed: {e}", severity="error")
+        time.sleep(1)
+        self.app.call_from_thread(self.poll_status)
+
+    def action_close(self) -> None:
+        if json.dumps(self.collect(), sort_keys=True) != json.dumps(self.saved, sort_keys=True) or self.live_updates():
+            self.app.push_screen(Confirm("Discard unsaved changes?"), lambda ok: ok and self.app.pop_screen())
+        else:
+            self.app.pop_screen()
+
+    def action_apply(self) -> None:
+        cfg = self.collect()
+        errs = self.validate(cfg)
+        self.query_one("#svc-errors", Static).update(Text("\n".join(errs), style="red"))
+        if not errs:
+            self.do_apply(cfg, self.live_updates(), restart=False)
+
+    def save_and_restart(self) -> None:
+        cfg = self.collect()
+        errs = self.validate(cfg)
+        self.query_one("#svc-errors", Static).update(Text("\n".join(errs), style="red"))
+        if errs:
+            return
+        top = docker("top", self.cname, check=False) if self.running else ""
+        procs = "\n".join(top.splitlines()[1:21]) if top else "(container is stopped)"
+        self.app.push_screen(
+            Confirm(f"Restart {self.cname}? Every process inside will be stopped.", "Running processes:\n" + procs),
+            lambda ok: ok and self.do_apply(cfg, self.live_updates(), restart=True))
+
+    @work(thread=True, exclusive=True, group="svc-apply")
+    def do_apply(self, cfg: dict, updates: list, restart: bool) -> None:
+        call = self.app.call_from_thread
+        done = []
+        try:
+            svc.write_config(self.cname, cfg)
+            done.append("settings saved")
+            for args in updates:
+                docker("update", *args, self.cname)
+                done.append("updated " + " ".join(args[::2]).replace("--", ""))
+            if restart:
+                docker("restart", self.cname)
+                done.append("container restarted")
+            elif self.running:
+                st = svc.status(self.cname)
+                stop, start, again = svc.plan(self.saved, cfg)
+                for sid in stop:
+                    if st.get(sid) in ("running", "restarting"):
+                        svc.exec_script(self.cname, "stop", sid)
+                for sid in again:
+                    if st.get(sid) in ("running", "restarting"):
+                        svc.exec_script(self.cname, "stop", sid)
+                        svc.exec_script(self.cname, "start", sid)
+                for sid in start:
+                    svc.exec_script(self.cname, "start", sid)
+                changed = len(stop) + len(start) + len(again)
+                done.append(f"{changed} service(s) updated" if changed else "no running service changed")
+        except (DockerError, RuntimeError) as e:
+            call(self.notify, f"Apply failed: {e}", severity="error", timeout=10)
+            return
+        self.saved = json.loads(json.dumps(cfg))
+        self.cfg = cfg
+        try:
+            c = inspect(self.cname)[0]
+            hc = c.get("HostConfig") or {}
+            self.c, self.cur_mem = c, hc.get("Memory") or 0
+            self.cur_restart = (hc.get("RestartPolicy") or {}).get("Name") in ("unless-stopped", "always")
+            self.cur_cpus = f"{hc['NanoCpus'] / 1e9:g}" if hc.get("NanoCpus") else ""
+        except (DockerError, IndexError):
+            pass
+        call(self.notify, "Applied: " + ", ".join(done))
+        time.sleep(1)
+        self.app.call_from_thread(self.poll_status)
+        call(self.app.action_refresh_all)
+
+
 # ---------------------------------------------------------------- 탭 위젯
 
 class ContainerTable(DataTable):
     BINDINGS = [
         Binding("n", "app.new_container", "New"),
         Binding("m", "app.recreate", "Recreate"),
+        Binding("v", "app.services", "Services"),
         Binding("s", "app.start_stop", "Start/Stop"),
         Binding("t", "app.restart_container", "Restart"),
         Binding("e", "app.exec_shell", "Shell"),
@@ -1619,6 +2052,17 @@ class DockerTUI(App):
     GpuToggle.-on:focus { border: round $accent; background: $success 25%; }
     #opts { grid-size: 2; grid-gutter: 0 2; height: auto; }
     #opts > * { height: auto; }
+    .svc-row { height: auto; }
+    .svc-name { width: 18; padding-top: 1; }
+    .svc-cmd { width: 35; }
+    #custom-rows { height: auto; }
+    .svc-inst { width: 17; padding-top: 1; }
+    .svc-status { width: 15; padding-top: 1; }
+    .svc-row Checkbox { width: auto; }
+    .svc-btn { min-width: 8; width: auto; }
+    .svc-banner { height: auto; }
+    .svc-banner Static { width: 1fr; }
+    #ssh-keys { height: 4; }
     .tz-row { height: auto; }
     .tz-row Select { width: 40; }
     .tz-row #tz-other { width: 30; }
@@ -1859,9 +2303,12 @@ class DockerTUI(App):
             t.append(f"    → {m.get('Destination')}{'' if m.get('RW', True) else ' (ro)'}\n")
         if not c.get("Mounts"):
             t.append("  none\n", style="dim")
-        cmd = (c["Config"].get("Entrypoint") or []) + (c["Config"].get("Cmd") or [])
+        cmd = container_argv(c)
         t.append("\nCommand\n", style="bold")
         t.append(f"  {shlex.join(cmd) if cmd else '-'}\n")
+        t.append("\nServices  ", style="bold")
+        t.append("autostart ready (press v)\n" if has_hook(c) else "no startup hook (press v for details)\n",
+                 style="green" if has_hook(c) else "dim")
         restart = (c["HostConfig"].get("RestartPolicy") or {}).get("Name") or "no"
         t.append(f"\nRestart policy  {restart}\n")
         box.update(t)
@@ -1878,6 +2325,34 @@ class DockerTUI(App):
             return
         spec, warns = spec_from_container(c)
         self.push_screen(RunForm(spec, recreate=c, warns=warns))
+
+    def open_recreate(self, name: str) -> None:
+        try:
+            c = inspect(name)[0]
+        except (DockerError, IndexError):
+            return
+        spec, warns = spec_from_container(c)
+        self.push_screen(RunForm(spec, recreate=c, warns=warns))
+
+    def action_services(self) -> None:
+        c = self.selected_container()
+        if c:
+            self.notify("Loading services…", timeout=2)
+            self.load_services(c["Name"].lstrip("/"))
+
+    @work(thread=True, exclusive=True, group="services")
+    def load_services(self, name: str) -> None:
+        try:
+            c = inspect(name)[0]
+        except (DockerError, IndexError) as e:
+            self.call_from_thread(self.notify, str(e), severity="error")
+            return
+        cfg = svc.read_config(name) or svc.default_config()
+        running = bool(c["State"].get("Running"))
+        installed = svc.installed(name) if running else {}
+        statuses = svc.status(name) if running and has_hook_or_script(name) else {}
+        # 화면 객체는 메인 스레드에서 만들어야 한다 (Python 3.9 의 Textual 은 이벤트 루프가 필요)
+        self.call_from_thread(lambda: self.push_screen(ServicesScreen(c, cfg, installed, statuses)))
 
     def action_start_stop(self) -> None:
         c = self.selected_container()
@@ -1981,8 +2456,18 @@ class DockerTUI(App):
                 if stream_cmd(["docker", "pull", spec.image], lambda line: say(line, "dim")) != 0:
                     raise DockerError(f"Could not pull image: {spec.image}")
                 say(f"✓ Pulled image {spec.image}", "green")
+            argv = None
+            if spec.hook:
+                if has_sh(spec.image):
+                    argv = resolve_argv(spec)
+                else:
+                    say("! This image has no /bin/sh, so Services (autostart) will not be available.", "yellow")
+            run_args = spec.args(argv)
             name_was_free = bool(spec.name) and not container_exists(spec.name)
-            cid = step("Started new container", *spec.args()[1:]).strip()
+            cid = step("Created new container", "create", *run_args[3:]).strip()
+            if old and not commit and svc.copy_config(old["Id"], cid):
+                say("✓ Copied service settings (/etc/tdock) from the original container", "green")
+            step("Started new container", "start", cid)
             time.sleep(2)
             state = inspect(cid)[0]["State"]
             if not state.get("Running"):

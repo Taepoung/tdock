@@ -16,6 +16,11 @@ and change the settings of an existing container without losing what you install
   - Options shown only when they apply: auto-restart, Docker inside the container (DooD), NVIDIA ulimits, host IPC (multi-GPU), debugger support
   - Live preview of the exact `docker run` command and validation before running
 - **Recreate** (`m`): commit the container, then rerun it with changed settings; rolls back automatically on failure
+- **Services** (`v`): start SSH, a VS Code tunnel, Jupyter or your own commands inside a container
+  - per service: *Start with container* and *Restart if it dies*
+  - detects what is installed inside, shows live status and logs
+  - changes apply immediately without restarting the container; running jobs are not touched
+  - also change auto-restart and the memory limit live (`docker update`)
 - **Images**: pull, delete, run
 - **GPU**: memory and utilization per GPU, and which running containers can access it
 - **Cleanup**: disk usage, remove stopped containers, unused images, build cache
@@ -105,7 +110,8 @@ tdock
 
 | Tab | Keys |
 |---|---|
-| Containers | `n` new, `m` recreate, `s` start/stop, `t` restart, `e` shell, `l` logs, `d` delete |
+| Containers | `n` new, `m` recreate, `v` services, `s` start/stop, `t` restart, `e` shell, `l` logs, `d` delete |
+| Services | `Ctrl+S` apply, `Esc` close |
 | Images | `n` run this image, `p` pull, `d` delete |
 | Mount folder tree | `→` add mount, `Backspace` parent, `o` open folder, `r` refresh |
 | Everywhere | `F5` refresh, `q` quit, `Ctrl+R` run (in the form), `Esc` cancel |
@@ -120,6 +126,19 @@ tdock
 - **Mounts** use `--mount` so a missing host path fails instead of silently creating an empty directory.
 - **DooD** mounts the Docker socket, the `docker` binary and CLI plugins. The binary mount works in glibc-based images
   (Ubuntu, Debian), not in Alpine.
+
+## Services: how it works
+
+Containers created by tdock get a small startup hook: on every start they run `/etc/tdock/startup.sh`
+(if present) in the background and then the image's original command.
+The Services screen writes that script and its settings into `/etc/tdock` inside the container,
+so they survive restarts and recreating with commit. Each service runs in its own process group
+under a tiny supervisor; logs go to `/var/log/tdock/<service>.log`.
+
+- Containers created without tdock have no hook; the Services screen offers a one-time recreate to add it.
+- SSH and Jupyter need a port mapping (e.g. `2222:22`), which can only be added by recreating.
+- A VS Code tunnel needs a one-time login inside the container: `code tunnel user login --provider github`.
+- Images without `/bin/sh` cannot use services.
 
 ## Files
 
