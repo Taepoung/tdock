@@ -1542,8 +1542,10 @@ class RunForm(Screen[None]):
         cache = self.__dict__.setdefault("_argv_cache", {})
         if key not in cache:
             argv = resolve_argv(spec)
-            # 이미지가 아직 없으면 실행할 때 결정된다
-            cache[key] = argv if argv is not None else ["<image default command>"]
+            # 이미지가 아직 없으면 entrypoint 는 받은 뒤에 결정된다
+            if argv is None:
+                argv = ["<image entrypoint>", *shlex.split(spec.command)] if spec.command else ["<image default command>"]
+            cache[key] = argv
         return cache[key]
 
     def errors(self, spec: RunSpec) -> list[str]:
