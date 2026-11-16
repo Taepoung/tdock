@@ -1709,6 +1709,7 @@ class ServicesScreen(Screen[None]):
         self.cur_mem = hc.get("Memory") or 0
         self.cur_restart = (hc.get("RestartPolicy") or {}).get("Name") in ("unless-stopped", "always")
         self.cur_cpus = f"{hc['NanoCpus'] / 1e9:g}" if hc.get("NanoCpus") else ""
+        self.auto_remove = bool(hc.get("AutoRemove"))   # --rm 컨테이너는 재시작 정책을 바꿀 수 없다
 
     # ---- 화면
     def compose(self) -> ComposeResult:
@@ -1756,8 +1757,9 @@ class ServicesScreen(Screen[None]):
 
             yield Label("Container settings  (applied immediately, no restart)")
             with Vertical(classes="res-box"):
-                yield Checkbox("Auto-restart the container (--restart unless-stopped)", value=self.cur_restart,
-                               id="live-restart")
+                if not self.auto_remove:
+                    yield Checkbox("Auto-restart the container (--restart unless-stopped)", value=self.cur_restart,
+                                   id="live-restart")
                 if caps["mem_limit"]:
                     limited = 0 < self.cur_mem < self.mem_total
                     with Horizontal(classes="res-row"):
@@ -1852,9 +1854,10 @@ class ServicesScreen(Screen[None]):
     def live_updates(self) -> list[list[str]]:
         """바로 바꿀 수 있는 컨테이너 설정 (docker update)."""
         ups = []
-        restart = self.query_one("#live-restart", Checkbox).value
-        if restart != self.cur_restart:
-            ups.append(["--restart", "unless-stopped" if restart else "no"])
+        if self.has("#live-restart"):
+            restart = self.query_one("#live-restart", Checkbox).value
+            if restart != self.cur_restart:
+                ups.append(["--restart", "unless-stopped" if restart else "no"])
         if self.has("#live-mem-on"):
             on = self.query_one("#live-mem-on", Checkbox).value
             want = size_bytes(self.query_one("#live-mem", Input).value) if on else self.mem_total
