@@ -25,6 +25,7 @@ from typing import Optional
 from rich.text import Text
 
 from . import services as svc
+from .dockercmd import DOCKER
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -76,7 +77,7 @@ class DockerError(Exception):
 
 
 def docker(*args: str, check: bool = True) -> str:
-    p = subprocess.run(["docker", *args], capture_output=True, text=True)
+    p = subprocess.run([*DOCKER, *args], capture_output=True, text=True)
     if check and p.returncode != 0:
         raise DockerError((p.stderr or p.stdout).strip() or f"docker {args[0]} failed")
     return p.stdout
@@ -93,7 +94,7 @@ def inspect(*names: str) -> list[dict]:
 
 
 def container_exists(name: str) -> bool:
-    return subprocess.run(["docker", "container", "inspect", name],
+    return subprocess.run([*DOCKER, "container", "inspect", name],
                           capture_output=True).returncode == 0
 
 
@@ -277,7 +278,7 @@ class PathMap:
                     m["root"] == n["root"] or m["root"].startswith(n["root"].rstrip("/") + "/")):
                 cands.append(os.path.normpath(n["mp"] + "/" + m["root"][len(n["root"].rstrip("/")):]))
         for cand in dict.fromkeys(cands):
-            p = subprocess.run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "ls",
+            p = subprocess.run([*DOCKER, "run", "--rm", "--network", "none", "--entrypoint", "ls",
                                 "--mount", f"type=bind,src={cand},dst=/m,readonly", image, "-1A", "/m"],
                                capture_output=True, text=True)
             if p.returncode == 0 and sorted(x for x in p.stdout.split("\n") if x)[:200] == want:
@@ -314,7 +315,7 @@ def detect_server_tz() -> str:
     image = PathMap._probe_image()
     if not image:
         return ""
-    p = subprocess.run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "date",
+    p = subprocess.run([*DOCKER, "run", "--rm", "--network", "none", "--entrypoint", "date",
                         "-v", f"{LOCALTIME}:{LOCALTIME}:ro", "-e", TZ_LOCALTIME, image, "+%Z %z"],
                        capture_output=True, text=True)
     return p.stdout.strip() if p.returncode == 0 else ""
@@ -491,7 +492,7 @@ def resolve_argv(spec: RunSpec) -> Optional[list]:
 
 
 def has_sh(image: str) -> bool:
-    return subprocess.run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "/bin/sh", image,
+    return subprocess.run([*DOCKER, "run", "--rm", "--network", "none", "--entrypoint", "/bin/sh", image,
                            "-c", "true"], capture_output=True).returncode == 0
 
 
@@ -503,7 +504,7 @@ def container_argv(c: dict) -> list:
 
 
 def has_hook_or_script(name: str) -> bool:
-    return subprocess.run(["docker", "exec", name, "test", "-f", svc.SCRIPT], capture_output=True).returncode == 0
+    return subprocess.run([*DOCKER, "exec", name, "test", "-f", svc.SCRIPT], capture_output=True).returncode == 0
 
 
 def has_hook(c: dict) -> bool:
@@ -704,7 +705,7 @@ class LogsView(ModalScreen[None]):
     def action_reload(self) -> None:
         log = self.query_one(RichLog)
         log.clear()
-        p = subprocess.run(["docker", "logs", "--tail", "1000", self.cname],
+        p = subprocess.run([*DOCKER, "logs", "--tail", "1000", self.cname],
                            capture_output=True, text=True)
         out = (p.stdout + p.stderr).rstrip()
         log.write(Text(out or "(no logs)"))
@@ -1046,7 +1047,7 @@ class PortEditor(Vertical):
 # ---------------------------------------------------------------- 이미지 선택
 
 def image_exists(ref: str) -> bool:
-    return subprocess.run(["docker", "image", "inspect", ref], capture_output=True).returncode == 0
+    return subprocess.run([*DOCKER, "image", "inspect", ref], capture_output=True).returncode == 0
 
 
 @functools.cache
@@ -1270,7 +1271,7 @@ class ImagePicker(ModalScreen[Optional[str]]):
     def do_pull(self, ref: str, log: RichLog, button: Button) -> None:
         call = self.app.call_from_thread
         call(self.status, f"Pulling {ref}... (esc is disabled until it finishes)")
-        rc = stream_cmd(["docker", "pull", ref], lambda line: call(log.write, Text(line)))
+        rc = stream_cmd([*DOCKER, "pull", ref], lambda line: call(log.write, Text(line)))
         self.busy = False
         if rc == 0:
             call(self.dismiss, ref)
@@ -2402,7 +2403,7 @@ class DockerTUI(App):
             return
         with self.suspend():
             print(f"\n[{name}] shell. Type exit to return.\n", flush=True)
-            subprocess.run(["docker", "exec", "-it", name, "sh", "-c",
+            subprocess.run([*DOCKER, "exec", "-it", name, "sh", "-c",
                             "if command -v bash >/dev/null; then exec bash -l; else exec sh; fi"])
         self.action_refresh_all()
 
@@ -2458,7 +2459,7 @@ class DockerTUI(App):
                     renamed = True
             if not image_exists(spec.image):
                 say(f"$ docker pull {spec.image}", "dim")
-                if stream_cmd(["docker", "pull", spec.image], lambda line: say(line, "dim")) != 0:
+                if stream_cmd([*DOCKER, "pull", spec.image], lambda line: say(line, "dim")) != 0:
                     raise DockerError(f"Could not pull image: {spec.image}")
                 say(f"✓ Pulled image {spec.image}", "green")
             argv = None
@@ -2526,7 +2527,7 @@ class DockerTUI(App):
     def pull(self, ref: str) -> None:
         log = TaskLog(f"pull: {ref}")
         self.push_screen(log)
-        self.stream_task(log, ["docker", "pull", ref])
+        self.stream_task(log, [*DOCKER, "pull", ref])
 
     @work(thread=True)
     def stream_task(self, log: TaskLog, cmd: list[str]) -> None:
@@ -2589,16 +2590,54 @@ class DockerTUI(App):
     def prune(self, label: str, *args: str) -> None:
         log = TaskLog(label)
         self.push_screen(log)
-        self.stream_task(log, ["docker", *args])
+        self.stream_task(log, [*DOCKER, *args])
+
+
+VERSION_ARGS = ["version", "--format", "{{.Server.Version}}"]
+
+
+def _sudo_keepalive() -> None:
+    """sudo 가 기억한 비밀번호가 만료되지 않도록 주기적으로 docker 를 한 번씩 부른다."""
+    while True:
+        time.sleep(60)
+        subprocess.run(["sudo", "-n", "docker", *VERSION_ARGS], capture_output=True)
+
+
+def use_sudo_docker() -> Optional[str]:
+    """docker 를 sudo 로만 쓸 수 있는 서버: 비밀번호를 한 번 받고 sudo 모드로 바꾼다. 실패하면 이유."""
+    import sys
+    if os.environ.get("TDOCK_NO_SUDO"):
+        return "sudo mode is disabled (TDOCK_NO_SUDO)."
+    if not shutil.which("sudo"):
+        return "sudo is not available."
+    if not sys.stdin.isatty():
+        return "cannot ask for the sudo password (not a terminal)."
+    print("tdock: you are not allowed to use Docker directly (not in the docker group).")
+    print("tdock: using 'sudo docker' instead. Enter your sudo password once.")
+    if subprocess.run(["sudo", "docker", *VERSION_ARGS], stdout=subprocess.DEVNULL).returncode != 0:
+        return "'sudo docker' did not work for this account."
+    # 비밀번호 없이(-n) 다시 되는지: sudo 가 비밀번호를 기억하지 않는 서버(timestamp_timeout=0)는 쓸 수 없다
+    if subprocess.run(["sudo", "-n", "docker", *VERSION_ARGS], capture_output=True).returncode != 0:
+        return "this server's sudo asks for the password every time, so tdock cannot run docker commands."
+    DOCKER[:] = ["sudo", "-n", "docker"]
+    threading.Thread(target=_sudo_keepalive, daemon=True).start()
+    return None
 
 
 def main() -> None:
     import sys
     if not shutil.which("docker"):
         sys.exit("tdock: the docker CLI was not found in PATH. Install Docker (or its CLI) first.")
-    p = subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"], capture_output=True, text=True)
+    p = subprocess.run([*DOCKER, *VERSION_ARGS], capture_output=True, text=True)
     if p.returncode != 0:
-        sys.exit("tdock: cannot reach the Docker daemon.\n" + (p.stderr.strip() or p.stdout.strip()))
+        err = (p.stderr.strip() or p.stdout.strip())
+        if "permission denied" not in err.lower():
+            sys.exit("tdock: cannot reach the Docker daemon.\n" + err)
+        reason = use_sudo_docker()
+        if reason:
+            sys.exit("tdock: permission denied on the Docker socket, and " + reason + "\n"
+                     "  Fix: ask an admin to add you to the docker group:  sudo usermod -aG docker $USER\n"
+                     "       then log out and back in.\n" + err)
     DockerTUI().run()
 
 

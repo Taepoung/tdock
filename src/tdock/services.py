@@ -15,6 +15,8 @@ import subprocess
 import tarfile
 import time
 
+from .dockercmd import DOCKER
+
 CONF_DIR = "/etc/tdock"
 SCRIPT = f"{CONF_DIR}/startup.sh"
 CONFIG = f"{CONF_DIR}/services.json"
@@ -179,7 +181,7 @@ esac
 # ---------------------------------------------------------------- 컨테이너와 주고받기
 
 def _docker(*args: str, data: bytes | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(["docker", *args], input=data, capture_output=True)
+    return subprocess.run([*DOCKER, *args], input=data, capture_output=True)
 
 
 def read_config(container: str) -> dict | None:
