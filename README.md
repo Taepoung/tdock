@@ -105,7 +105,9 @@ source ~/.bashrc
 ## Usage
 
 ```bash
-tdock
+tdock            # start
+tdock --sudo     # when Docker is only allowed through sudo on this server
+tdock --version
 ```
 
 | Tab | Keys |
@@ -119,9 +121,9 @@ tdock
 ## Notes
 
 - **Docker only through sudo**: if your account is not in the `docker` group but may run `sudo docker`,
-  tdock asks for your sudo password once at startup and then runs every Docker command as `sudo docker`
-  (it keeps sudo's cached credentials alive while it runs). Set `TDOCK_NO_SUDO=1` to disable this.
-  If your sudo asks for the password every time, ask an admin to add you to the `docker` group instead.
+  start tdock with `tdock --sudo`. It asks for your sudo password once and runs every Docker command as
+  `sudo docker` (keeping sudo's cached credentials alive while it runs). If your sudo asks for the password
+  every time, ask an admin to add you to the `docker` group instead.
 - **Rootless Docker**: detected automatically. Options the daemon cannot honor are hidden
   (for example the CPU limit when the cpu cgroup controller is not delegated, or `memlock=-1`).
 - **Running tdock inside a container**: if your shell is itself a container that talks to the host daemon,

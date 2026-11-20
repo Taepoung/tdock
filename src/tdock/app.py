@@ -2604,16 +2604,13 @@ def _sudo_keepalive() -> None:
 
 
 def use_sudo_docker() -> Optional[str]:
-    """docker 를 sudo 로만 쓸 수 있는 서버: 비밀번호를 한 번 받고 sudo 모드로 바꾼다. 실패하면 이유."""
+    """tdock --sudo: 비밀번호를 한 번 받고 docker 명령을 sudo 로 실행한다. 실패하면 이유."""
     import sys
-    if os.environ.get("TDOCK_NO_SUDO"):
-        return "sudo mode is disabled (TDOCK_NO_SUDO)."
     if not shutil.which("sudo"):
         return "sudo is not available."
     if not sys.stdin.isatty():
         return "cannot ask for the sudo password (not a terminal)."
-    print("tdock: you are not allowed to use Docker directly (not in the docker group).")
-    print("tdock: using 'sudo docker' instead. Enter your sudo password once.")
+    print("tdock: running Docker commands with sudo. Enter your sudo password once.")
     if subprocess.run(["sudo", "docker", *VERSION_ARGS], stdout=subprocess.DEVNULL).returncode != 0:
         return "'sudo docker' did not work for this account."
     # 비밀번호 없이(-n) 다시 되는지: sudo 가 비밀번호를 기억하지 않는 서버(timestamp_timeout=0)는 쓸 수 없다
@@ -2624,20 +2621,35 @@ def use_sudo_docker() -> Optional[str]:
     return None
 
 
+GROUP_HINT = ("  Fix: ask an admin to add you to the docker group:  sudo usermod -aG docker $USER\n"
+              "       then log out and back in.")
+
+
 def main() -> None:
+    import argparse
     import sys
+    from . import __version__
+    ap = argparse.ArgumentParser(prog="tdock", description="A terminal UI for managing Docker containers.")
+    ap.add_argument("--sudo", action="store_true",
+                    help="run Docker commands with sudo (asks for your password once); "
+                         "for servers where Docker is only allowed through sudo")
+    ap.add_argument("--version", action="version", version=f"tdock {__version__}")
+    args = ap.parse_args()
+
     if not shutil.which("docker"):
         sys.exit("tdock: the docker CLI was not found in PATH. Install Docker (or its CLI) first.")
-    p = subprocess.run([*DOCKER, *VERSION_ARGS], capture_output=True, text=True)
-    if p.returncode != 0:
-        err = (p.stderr.strip() or p.stdout.strip())
-        if "permission denied" not in err.lower():
-            sys.exit("tdock: cannot reach the Docker daemon.\n" + err)
+    if args.sudo:
         reason = use_sudo_docker()
         if reason:
-            sys.exit("tdock: permission denied on the Docker socket, and " + reason + "\n"
-                     "  Fix: ask an admin to add you to the docker group:  sudo usermod -aG docker $USER\n"
-                     "       then log out and back in.\n" + err)
+            sys.exit("tdock: --sudo failed: " + reason + "\n" + GROUP_HINT)
+    else:
+        p = subprocess.run([*DOCKER, *VERSION_ARGS], capture_output=True, text=True)
+        if p.returncode != 0:
+            err = (p.stderr.strip() or p.stdout.strip())
+            if "permission denied" in err.lower():
+                sys.exit("tdock: permission denied on the Docker socket (you are not in the docker group).\n"
+                         "  If you use Docker with sudo on this server, run:  tdock --sudo\n" + GROUP_HINT)
+            sys.exit("tdock: cannot reach the Docker daemon.\n" + err)
     DockerTUI().run()
 
 
